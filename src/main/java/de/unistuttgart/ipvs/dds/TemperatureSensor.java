@@ -1,6 +1,7 @@
 package de.unistuttgart.ipvs.dds;
 
 import java.util.*;
+import java.util.concurrent.ThreadLocalRandom;
 
 import de.unistuttgart.ipvs.dds.avro.TemperatureData;
 import de.unistuttgart.ipvs.dds.avro.TemperatureUnit;
@@ -37,6 +38,12 @@ public class TemperatureSensor {
                 ? TemperatureUnit.valueOf(args[5])
                 : TemperatureUnit.C;
 
+        /* Amount of nose to add to the base signal */
+        final double noiseAmount = args.length > 6 ? Double.parseDouble(args[6]) : 0.1;
+
+        /* How long to wait between temperature measurements (in ms) */
+        final long measurementInterval = (long) ((args.length > 7 ? Double.parseDouble(args[7]) : 1000) * 1000);
+
         /* Client ID with which to register with Kafka */
         final String clientId = "temperature-sensor";
 
@@ -47,7 +54,7 @@ public class TemperatureSensor {
         producerProperties.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaBroker);
         producerProperties.put(ProducerConfig.CLIENT_ID_CONFIG, clientId);
 
-        final SpecificAvroSerde<TemperatureData> helloSerde = createSerde(schemaRegistry);
+        final SpecificAvroSerde<TemperatureData> temperatureDataSerde = createSerde(schemaRegistry);
 
         final long startTimestamp = System.currentTimeMillis();
         final Random random = new Random();
@@ -55,9 +62,15 @@ public class TemperatureSensor {
         try (KafkaProducer<String, TemperatureData> producer = new KafkaProducer<>(
                 producerProperties,
                 Serdes.String().serializer(),
-                helloSerde.serializer()
+                temperatureDataSerde.serializer()
         )) {
             long messageNumber = 0;
+
+            // Leave at least 20s of warmup before the first spike is triggered.
+            long spikeStart = ThreadLocalRandom.current().nextLong(20000, 60000);
+            // The first spike will always last about 5s.
+            long spikeDuration = 5;
+            long spikeEnd = 1000;
             while (true) {
                 /*
                  * Generate some sample temperature data based on the runtime of the sensor. We'll simulate an
@@ -66,27 +79,60 @@ public class TemperatureSensor {
                  * TODO: Add generation of random temperature spikes that go away after some time
                  */
                 final long now = System.currentTimeMillis();
-                final double exponent = (startTimestamp - now) / 30000d;
-                final double multiplier = targetTemperature - baseTemperature;
-                final double temperatureBase = baseTemperature + (1 - Math.pow(Math.E, exponent)) * multiplier;
-                final double temperatureNoise = random.nextDouble() * 0.1;
-                final double temperature = temperatureBase + temperatureNoise;
+
+                final long deltaT = now - startTimestamp;
+                double temperatureBase = simulateTemperature(baseTemperature, targetTemperature, deltaT);
+                if (now > spikeStart) {
+                    if (now > spikeEnd) {
+                        // The spike ended, set the parameters for the next one
+
+                        // Create the next spike somewhere between now and 60 seconds in the future.
+                        spikeStart = ThreadLocalRandom.current().nextLong(60000);
+                        // Make the spike last between one and ten seconds.
+                        spikeDuration = ThreadLocalRandom.current().nextLong(1000, 10000);
+                        // The actual end of the whole spike is double its duration. During the spikeDuration, the
+                        // temperature rises, but it takes the same time to drop down to the 'normal' level again.
+                        spikeEnd = spikeStart + spikeDuration * 2;
+                    } else if (now - spikeStart < spikeDuration) {
+                        // Temperature spike in progress, temperature is rising
+                        temperatureBase += simulateTemperature(0, 10, now - spikeStart);
+                    } else {
+                        // Temperature spike is over, cooling off again
+                        temperatureBase += simulateTemperature(10, 0, now - (spikeStart + spikeDuration));
+                    }
+                }
+                final double temperature = temperatureBase + simulateNoise(noiseAmount);
 
                 final TemperatureData message = new TemperatureData(sensorId, now, temperature, temperatureUnit);
 
                 logger.info("Sending #" + ++messageNumber + " (" + (double)messageNumber / (now - startTimestamp) * 1000d + "/s): " + message.toString());
                 producer.send(new ProducerRecord<>(outputTopic, sensorId, message));
 
-                try {
-                    Thread.sleep(1000);
-                } catch (InterruptedException e) {
-                    logger.info("Terminating because the thread was interrupted");
-                    break;
+                if (measurementInterval < 1000) {
+                    // We're in the nanosecond range, Thread.sleep() won't do.
+                    final long endWait = System.nanoTime() + measurementInterval;
+                    // A busy loop has to do.
+                    while (System.nanoTime() < endWait) { }
+                } else {
+                    try {
+                        Thread.sleep(measurementInterval / 1000);
+                    } catch (InterruptedException e) {
+                        logger.info("Terminating because the thread was interrupted");
+                        break;
+                    }
                 }
             }
         } catch (Exception e) {
             logger.error("Terminating because an error was encountered", e);
         }
+    }
+
+    private static double simulateTemperature(double baseTemp, double targetTemp, long deltaT) {
+        return baseTemp + (1 - Math.pow(Math.E, -deltaT / 30000d)) * (targetTemp - baseTemp);
+    }
+
+    private static double simulateNoise(double amount) {
+        return ThreadLocalRandom.current().nextDouble(-amount, amount);
     }
 
     /**
